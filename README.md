@@ -8,10 +8,10 @@ Savage N., Grewal S., Shaikh V., Zemp F., McKenna D., Mikolajewicz N., Najem H.,
 - GL261 WT vs KO tumor dataset: [https://doi.org/10.6084/m9.figshare.31926462](https://doi.org/10.6084/m9.figshare.31926462)
 
 ## Files
-- `01_export_gpnmb_wtko_publishable.Rmd`: exports the GL261 WT vs KO tumor dataset, writes a Matrix Market bundle plus metadata tables, and reproduces tumor-side UMAP, tumor-state, DEG, and Neftel GSEA outputs.
-- `02_export_myeloid_meta_atlas_publishable.Rmd`: exports the CNS myeloid meta-atlas, writes a Matrix Market bundle plus metadata tables, and reproduces atlas UMAP and GPNMB/state summary outputs.
-- `03_gpnmb_scRNA_methods_reproducibility.Rmd`: methods-oriented notebook that consolidates figure and statistics reproduction for the tumor and myeloid analyses, including sample-size tables used for manuscript/reviewer responses.
-- `04_gpnmb_myeloid_meta_atlas_nmf_reproducibility.R`: reproducibility script for the myeloid atlas NMF workflow. 
+- `01_export_gpnmb_wtko_publishable.Rmd`: exports the GL261 WT vs KO tumor dataset, and reproduces tumor-side UMAP, tumor-state, DEG, and Neftel GSEA outputs.
+- `02_export_myeloid_meta_atlas_publishable.Rmd`: exports the CNS myeloid meta-atlas, and reproduces atlas UMAP and GPNMB/state summary outputs.
+- `03_gpnmb_scRNA_methods_reproducibility.Rmd`: methods-oriented notebook that consolidates figure and statistics reproduction for the tumor and myeloid analyses.
+- `04_gpnmb_myeloid_meta_atlas_nmf_reproducibility.R`: myeloid atlas NMF workflow. 
 
 ## Software requirements
 
