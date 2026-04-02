@@ -17,7 +17,9 @@
 # Default behavior uses the archived release objects already present in Analyses/.
 # That mode is the one intended for the GPNMB submission bundle. The optional
 # rebuild/rerun modes are off by default because the full cohort-level inputs are
-# not all shipped in this repository snapshot.
+# not all shipped in this repository snapshot. The robust-program rederivation
+# step is also off by default because it is computationally heavy; enable it with
+# GPNMB_REDERIVE_MYELOID_PROGRAMS=TRUE when a full rerun is desired.
 
 options(stringsAsFactors = FALSE)
 
@@ -74,6 +76,7 @@ dir.create(repro_object_dir, recursive = TRUE, showWarnings = FALSE)
 config <- list(
   rebuild_atlas_from_components = as_flag(Sys.getenv("GPNMB_REBUILD_MYELOID_ATLAS"), default = FALSE),
   rerun_sample_nmf = as_flag(Sys.getenv("GPNMB_RERUN_MYELOID_NMF"), default = FALSE),
+  rederive_robust_programs = as_flag(Sys.getenv("GPNMB_REDERIVE_MYELOID_PROGRAMS"), default = FALSE),
   top_n_genes = as.integer(Sys.getenv("GPNMB_TOP_N_GENES", "50")),
   intra_threshold = as.numeric(Sys.getenv("GPNMB_INTRA_THRESHOLD", "0.5")),
   inter_threshold = as.numeric(Sys.getenv("GPNMB_INTER_THRESHOLD", "0.3")),
@@ -166,6 +169,10 @@ jaccard_similarity_matrix <- function(gene_sets) {
   gene_sets <- lapply(gene_sets, function(x) unique(as.character(stats::na.omit(x))))
   gene_sets <- gene_sets[lengths(gene_sets) > 0]
   stopifnot(length(gene_sets) > 0)
+
+  if (length(gene_sets) > 1 && requireNamespace("scMiko", quietly = TRUE)) {
+    return(scMiko::jaccardSimilarityMatrix(gene_sets))
+  }
 
   n_sets <- length(gene_sets)
   set_names <- names(gene_sets)
@@ -737,19 +744,42 @@ if (!is.na(gpnmb_feature)) {
   save_plot_pair(p_gpnmb, file.path(fig_dir, "gpnmb_myeloid_featureplot_gpnmb"), width = 8, height = 6)
 }
 
-if (config$rerun_sample_nmf) {
-  nmf_results <- run_samplewise_nmf(unlist(component_lists, recursive = FALSE), k_ranks = config$k_ranks)
-  nmf_object_path <- file.path(repro_object_dir, "NMF_myeloid_v1_160523_rebuilt_for_submission.rds")
+archived_gene_set_path <- file.path(analysis_dir, "ZMyeloid_MyCat_NMF_genesets_050524.rds")
+archived_gene_sets_available <- file.exists(archived_gene_set_path)
+
+robust_nmf <- NULL
+nmf_object_path <- NA_character_
+
+if (config$rederive_robust_programs || !archived_gene_sets_available) {
+  if (config$rerun_sample_nmf) {
+    nmf_results <- run_samplewise_nmf(unlist(component_lists, recursive = FALSE), k_ranks = config$k_ranks)
+    nmf_object_path <- file.path(repro_object_dir, "NMF_myeloid_v1_160523_rebuilt_for_submission.rds")
+  } else {
+    nmf_object_path <- file.path(analysis_dir, "NMF_myeloid_v1_160523.rds")
+    stopifnot(file.exists(nmf_object_path))
+    nmf_results <- readRDS(nmf_object_path)
+  }
+
+  timestamp_message("Loaded myeloid NMF object: ", basename(nmf_object_path))
+  robust_nmf <- derive_robust_programs(nmf_results)
+  consensus_programs <- robust_nmf$consensus_programs
+  program_source_tbl <- tibble::tibble(
+    source_mode = "rederived_from_nmf",
+    atlas_object = basename(atlas_object_path),
+    nmf_object = basename(nmf_object_path)
+  )
 } else {
-  nmf_object_path <- file.path(analysis_dir, "NMF_myeloid_v1_160523.rds")
-  stopifnot(file.exists(nmf_object_path))
-  nmf_results <- readRDS(nmf_object_path)
+  archived_gene_sets <- readRDS(archived_gene_set_path)
+  consensus_programs <- lapply(archived_gene_sets, as.character)
+  names(consensus_programs) <- sub("^MyCat_", "", names(consensus_programs))
+  program_source_tbl <- tibble::tibble(
+    source_mode = "archived_release_gene_sets",
+    atlas_object = basename(atlas_object_path),
+    nmf_object = NA_character_
+  )
 }
 
-timestamp_message("Loaded myeloid NMF object: ", basename(nmf_object_path))
-
-robust_nmf <- derive_robust_programs(nmf_results)
-consensus_programs <- robust_nmf$consensus_programs
+readr::write_tsv(program_source_tbl, file.path(stats_dir, "gpnmb_myeloid_program_source.tsv"))
 
 programs_long <- bind_rows(lapply(names(consensus_programs), function(program_name) {
   tibble::tibble(
@@ -762,17 +792,18 @@ programs_wide <- named_list_to_padded_df(consensus_programs)
 readr::write_tsv(programs_long, file.path(stats_dir, "gpnmb_myeloid_consensus_nmf_programs_long.tsv"))
 readr::write_tsv(programs_wide, file.path(stats_dir, "gpnmb_myeloid_consensus_nmf_programs_wide.tsv"))
 
-cluster_annotation <- robust_nmf$cluster_annotation %>%
-  dplyr::arrange(cluster, dplyr::desc(cross_sample_support), component)
-readr::write_tsv(cluster_annotation, file.path(stats_dir, "gpnmb_myeloid_nmf_component_cluster_annotation.tsv"))
+if (!is.null(robust_nmf)) {
+  cluster_annotation <- robust_nmf$cluster_annotation %>%
+    dplyr::arrange(cluster, dplyr::desc(cross_sample_support), component)
+  readr::write_tsv(cluster_annotation, file.path(stats_dir, "gpnmb_myeloid_nmf_component_cluster_annotation.tsv"))
+}
 
 program_summary <- programs_long %>%
   count(program, name = "n_genes") %>%
   arrange(program)
 readr::write_tsv(program_summary, file.path(stats_dir, "gpnmb_myeloid_nmf_program_summary.tsv"))
 
-archived_gene_set_path <- file.path(analysis_dir, "ZMyeloid_MyCat_NMF_genesets_050524.rds")
-if (file.exists(archived_gene_set_path)) {
+if (!is.null(robust_nmf) && archived_gene_sets_available) {
   archived_gene_sets <- readRDS(archived_gene_set_path)
   archived_gene_sets <- lapply(archived_gene_sets, as.character)
   overlap_tbl <- match_programs_by_jaccard(consensus_programs, archived_gene_sets)
