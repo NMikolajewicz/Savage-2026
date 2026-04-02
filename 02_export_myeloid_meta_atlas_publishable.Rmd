@@ -1,0 +1,396 @@
+---
+title: "Export CNS myeloid meta-atlas dataset"
+output:
+  html_document:
+    toc: true
+    toc_float: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This notebook exports the local CNS myeloid meta-atlas into a publication-friendly bundle and reproduces the key embedding panels used in the GPNMB manuscript context.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(parallel)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+})
+```
+
+```{r helpers}
+submission_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+analysis_dir <- normalizePath(file.path(submission_dir, ".."), winslash = "/", mustWork = TRUE)
+output_dir <- file.path(submission_dir, "outputs")
+stats_dir <- file.path(output_dir, "stats")
+fig_dir <- file.path(output_dir, "figures")
+dataset_dir <- file.path(output_dir, "cns_myeloid_meta_atlas_cell_by_gene")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(stats_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(dataset_dir, recursive = TRUE, showWarnings = FALSE)
+
+pick_first_match <- function(x, candidates) {
+  hit <- candidates[candidates %in% x]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_feature_name <- function(object, candidates) {
+  feat <- rownames(object)
+  hit <- feat[toupper(feat) %in% toupper(candidates)]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_assay_layer <- function(object, assay, preferred = c("counts", "data")) {
+  assay_obj <- object[[assay]]
+  available_layers <- tryCatch(SeuratObject::Layers(assay_obj), error = function(e) character())
+  for (candidate in preferred) {
+    if (candidate %in% available_layers) {
+      return(candidate)
+    }
+  }
+
+  available_slots <- tryCatch(slotNames(assay_obj), error = function(e) character())
+  for (candidate in preferred) {
+    if (candidate %in% available_slots) {
+      return(candidate)
+    }
+  }
+
+  stop(sprintf(
+    "Could not find any of %s in assay '%s'.",
+    paste(preferred, collapse = ", "),
+    assay
+  ))
+}
+
+pick_umap_reduction <- function(object, preferred = character()) {
+  reduction_names <- names(object@reductions)
+
+  preferred_hit <- preferred[preferred %in% reduction_names]
+  if (length(preferred_hit) > 0) {
+    return(preferred_hit[[1]])
+  }
+
+  umap_hit <- reduction_names[grepl("umap", reduction_names, ignore.case = TRUE)]
+  if (length(umap_hit) > 0) {
+    return(umap_hit[[1]])
+  }
+
+  two_dim_hit <- reduction_names[vapply(
+    reduction_names,
+    function(reduction_name) {
+      embedding <- tryCatch(SeuratObject::Embeddings(object[[reduction_name]]), error = function(e) NULL)
+      !is.null(embedding) && ncol(embedding) >= 2
+    },
+    logical(1)
+  )]
+  if (length(two_dim_hit) > 0) {
+    return(two_dim_hit[[1]])
+  }
+
+  stop("No UMAP-like or other 2D reduction found in the Seurat object.")
+}
+
+gzip_copy <- function(path) {
+  gz_path <- paste0(path, ".gz")
+  in_con <- file(path, open = "rb")
+  on.exit(close(in_con), add = TRUE)
+  out_con <- gzfile(gz_path, open = "wb")
+  on.exit(close(out_con), add = TRUE)
+  repeat {
+    chunk <- readBin(in_con, what = raw(), n = 65536)
+    if (!length(chunk)) {
+      break
+    }
+    writeBin(chunk, out_con)
+  }
+  unlink(path)
+  gz_path
+}
+
+write_tsv_gz <- function(df, path_stub) {
+  readr::write_tsv(df, path_stub)
+  gzip_copy(path_stub)
+}
+
+save_plot_pair <- function(plot_handle, stem, width = 8, height = 6) {
+  ggsave(filename = paste0(stem, ".pdf"), plot = plot_handle, width = width, height = height, units = "in")
+  ggsave(filename = paste0(stem, ".png"), plot = plot_handle, width = width, height = height, units = "in", dpi = 300)
+}
+
+extract_named_vector <- function(x, cell_ids) {
+  if (is.atomic(x) && !is.null(names(x))) {
+    return(x[names(x) %in% cell_ids])
+  }
+  if (is.data.frame(x)) {
+    id_col <- pick_first_match(colnames(x), c("cell_id", "cell", "barcode", "sample", "rownames"))
+    value_col <- pick_first_match(colnames(x), c("state", "subtype", "label", "assignment", "class"))
+    if (!is.na(id_col) && !is.na(value_col)) {
+      out <- x[[value_col]]
+      names(out) <- x[[id_col]]
+      return(out[names(out) %in% cell_ids])
+    }
+  }
+  if (is.list(x)) {
+    for (element in x) {
+      current <- tryCatch(extract_named_vector(element, cell_ids), error = function(e) NULL)
+      if (!is.null(current) && length(current) > 0) {
+        return(current)
+      }
+    }
+  }
+  NULL
+}
+```
+
+## Inputs and provenance
+
+```{r provenance}
+manifest <- tibble::tribble(
+  ~label, ~path, ~role, ~status,
+  "Integrated myeloid object", file.path(analysis_dir, "seurat_all_myeloid_160523.rds"), "Primary execution target", "required",
+  "Myeloid NMF object", file.path(analysis_dir, "NMF_myeloid_v1_160523.rds"), "Gene-program context", "optional",
+  "Inferred-state object", file.path(analysis_dir, "ZM_myeloid_inferred_states.rds"), "State annotations", "optional",
+  "Myeloid gene-set object", file.path(analysis_dir, "ZMyeloid_MyCat_NMF_genesets_050524.rds"), "Program export", "optional",
+  "GPNMB CDI object", file.path(analysis_dir, "ZMyeloid_03_CDI_GPNMB_Myeloid_050524.rds"), "Associated-gene export", "optional"
+)
+
+readr::write_tsv(manifest, file.path(stats_dir, "myeloid_meta_atlas_object_manifest.tsv"))
+manifest
+```
+
+```{r cohort-provenance}
+cohort_manifest <- tibble::tribble(
+  ~cohort_label, ~object_name, ~availability_note,
+  "Mikolajewicz current cohort", "seurat_object_myeloid_current_150523.rds", "Local file present in Analyses",
+  "Abdelfattah cohort", "seurat_object_myeloid_abdel_150523.rds", "Local file present in Analyses",
+  "Wang cohort", "seurat_object_myeloid_wang_150523.rds", "Local file present in Analyses",
+  "Franjic", "seurat_object_myeloid_franjic.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Kanton", "seurat_object_myeloid_kanton.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Khrameeva", "seurat_object_myeloid_khrameeva.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Jakel", "seurat_object_myeloid_jakel.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Schirmer", "seurat_object_myeloid_schirmer.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Sun", "seurat_object_myeloid_sun.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Kim", "seurat_object_myeloid_kim.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Biermann", "seurat_object_myeloid_biermann.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Heming", "seurat_object_myeloid_heming.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Wei", "seurat_object_myeloid_wei.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Riemondy", "seurat_object_myeloid_riemond.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Lau", "seurat_object_myeloid_lau.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Smajic", "seurat_object_myeloid_smajic.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Yu", "seurat_object_myeloid_yu.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Fan", "seurat_object_myeloid_fan.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Cao", "seurat_object_myeloid_cao.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Bhaduri", "seurat_object_myeloid_bhaduri.rds", "Referenced through legacy scripts / Dropbox-oriented provenance",
+  "Aldinger", "seurat_object_myeloid_aldinger.rds", "Referenced through legacy scripts / Dropbox-oriented provenance"
+)
+
+readr::write_tsv(cohort_manifest, file.path(stats_dir, "myeloid_meta_atlas_cohort_manifest.tsv"))
+cohort_manifest
+```
+
+```{r load-object}
+object_path <- manifest$path[manifest$label == "Integrated myeloid object"]
+stopifnot(file.exists(object_path))
+so <- readRDS(object_path)
+# Prefer the stored BBKNN embedding ("b") for the myeloid meta-atlas object.
+umap_reduction <- pick_umap_reduction(so, preferred = "b")
+
+meta <- so@meta.data %>%
+  tibble::rownames_to_column("cell_id")
+
+sample_col <- pick_first_match(colnames(meta), c("clean.id2", "clean.id", "sample", "Barcode", "orig.ident"))
+study_col <- pick_first_match(colnames(meta), c("study", "Study"))
+etiology_col <- pick_first_match(colnames(meta), c("etiology", "type", "diagnosis", "PR", "PR2"))
+state_col <- pick_first_match(colnames(meta), c("subtype", "state", "label", "assignment", "class", "G1"))
+
+meta$sample_id <- if (!is.na(sample_col)) as.character(meta[[sample_col]]) else meta$cell_id
+meta$study_clean <- if (!is.na(study_col)) as.character(meta[[study_col]]) else "unspecified_study"
+meta$etiology_clean <- if (!is.na(etiology_col)) as.character(meta[[etiology_col]]) else "unspecified_etiology"
+meta$state_clean <- if (!is.na(state_col)) as.character(meta[[state_col]]) else NA_character_
+
+state_object_path <- manifest$path[manifest$label == "Inferred-state object"]
+if (file.exists(state_object_path)) {
+  inferred_states <- readRDS(state_object_path)
+  inferred_vector <- extract_named_vector(inferred_states, meta$cell_id)
+  if (!is.null(inferred_vector) && length(inferred_vector) > 0) {
+    meta$state_clean[match(names(inferred_vector), meta$cell_id)] <- as.character(inferred_vector)
+  }
+}
+
+so$sample_id <- meta$sample_id
+so$study_clean <- meta$study_clean
+so$etiology_clean <- meta$etiology_clean
+so$state_clean <- meta$state_clean
+
+gene_feature <- pick_feature_name(so, c("GPNMB", "Gpnmb"))
+assay_use <- if ("RNA" %in% names(so@assays)) "RNA" else DefaultAssay(so)
+layer_use <- pick_assay_layer(so, assay_use)
+counts_mat <- Seurat::GetAssayData(so, assay = assay_use, layer = layer_use)
+
+meta_export <- meta %>%
+  dplyr::select(cell_id, sample_id, study_clean, etiology_clean, state_clean, dplyr::everything())
+```
+
+## Export publication-friendly matrices and metadata
+
+```{r export-matrix}
+matrix_path <- file.path(dataset_dir, "matrix.mtx")
+Matrix::writeMM(counts_mat, matrix_path)
+gzip_copy(matrix_path)
+
+feature_tbl <- tibble::tibble(
+  feature_id = rownames(counts_mat),
+  feature_name = rownames(counts_mat)
+)
+barcode_tbl <- tibble::tibble(barcode = colnames(counts_mat))
+
+write_tsv_gz(feature_tbl, file.path(dataset_dir, "features.tsv"))
+write_tsv_gz(barcode_tbl, file.path(dataset_dir, "barcodes.tsv"))
+write_tsv_gz(meta_export, file.path(output_dir, "cns_myeloid_meta_atlas_cell_metadata.tsv"))
+
+sample_metadata <- meta_export %>%
+  dplyr::group_by(sample_id, study_clean, etiology_clean, state_clean) %>%
+  dplyr::summarise(n_cells = dplyr::n(), .groups = "drop")
+
+write_tsv_gz(sample_metadata, file.path(output_dir, "cns_myeloid_meta_atlas_sample_metadata.tsv"))
+```
+
+## Embedding reproduction
+
+```{r umap-plots}
+if (!is.na(study_col)) {
+  p_study <- DimPlot(so, reduction = umap_reduction, group.by = "study_clean", raster = FALSE, label = FALSE) +
+    ggtitle("CNS myeloid meta-atlas", subtitle = "Study / cohort")
+  save_plot_pair(p_study, file.path(fig_dir, "myeloid_meta_atlas_umap_study"), width = 10, height = 8)
+}
+
+if (!is.na(etiology_col)) {
+  p_etiology <- DimPlot(so, reduction = umap_reduction, group.by = "etiology_clean", raster = FALSE, label = FALSE) +
+    ggtitle("CNS myeloid meta-atlas", subtitle = "Etiology / diagnosis")
+  save_plot_pair(p_etiology, file.path(fig_dir, "myeloid_meta_atlas_umap_etiology"), width = 10, height = 8)
+}
+
+if (any(!is.na(meta$state_clean))) {
+  p_state <- DimPlot(so, reduction = umap_reduction, group.by = "state_clean", raster = FALSE, label = FALSE) +
+    ggtitle("CNS myeloid meta-atlas", subtitle = "Inferred state / subtype")
+  save_plot_pair(p_state, file.path(fig_dir, "myeloid_meta_atlas_umap_state"), width = 10, height = 8)
+}
+
+if (!is.na(gene_feature)) {
+  p_gpnmb <- FeaturePlot(so, reduction = umap_reduction, features = gene_feature, raster = FALSE) +
+    ggtitle("CNS myeloid meta-atlas", subtitle = paste0(gene_feature, " expression"))
+  save_plot_pair(p_gpnmb, file.path(fig_dir, "myeloid_meta_atlas_umap_gpnmb_expression"), width = 8, height = 6)
+}
+```
+
+## Figure-input tables
+
+```{r figure-inputs}
+expr_values <- if (!is.na(gene_feature)) {
+  as.numeric(Seurat::FetchData(so, vars = gene_feature)[, 1])
+} else {
+  rep(NA_real_, nrow(meta_export))
+}
+
+expression_by_cell <- meta_export %>%
+  dplyr::mutate(gpnmb_expression = expr_values)
+
+expression_by_sample <- expression_by_cell %>%
+  dplyr::group_by(sample_id, study_clean, etiology_clean, state_clean) %>%
+  dplyr::summarise(
+    mean_expression = mean(gpnmb_expression, na.rm = TRUE),
+    median_expression = median(gpnmb_expression, na.rm = TRUE),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+
+readr::write_tsv(expression_by_cell, file.path(stats_dir, "myeloid_meta_atlas_gpnmb_expression_by_cell.tsv"))
+readr::write_tsv(expression_by_sample, file.path(stats_dir, "myeloid_meta_atlas_gpnmb_expression_by_sample.tsv"))
+
+state_counts <- expression_by_cell %>%
+  dplyr::group_by(etiology_clean, state_clean, sample_id) %>%
+  dplyr::summarise(n_cells = dplyr::n(), .groups = "drop")
+
+readr::write_tsv(state_counts, file.path(stats_dir, "myeloid_meta_atlas_state_counts.tsv"))
+```
+
+## Program and associated-gene exports
+
+```{r program-exports}
+gene_set_path <- manifest$path[manifest$label == "Myeloid gene-set object"]
+if (file.exists(gene_set_path)) {
+  gene_set_object <- readRDS(gene_set_path)
+  if (is.list(gene_set_object)) {
+    if (length(gene_set_object) == 1 && is.list(gene_set_object[[1]])) {
+      gene_set_object <- gene_set_object[[1]]
+    }
+    gene_set_tbl <- purrr::imap_dfr(gene_set_object, function(value, key) {
+      tibble::tibble(program = key, gene = as.character(value))
+    }) %>%
+      dplyr::filter(!is.na(gene), gene != "")
+    readr::write_tsv(gene_set_tbl, file.path(stats_dir, "myeloid_meta_atlas_program_gene_sets.tsv"))
+  }
+}
+
+cdi_path <- manifest$path[manifest$label == "GPNMB CDI object"]
+if (file.exists(cdi_path)) {
+  cdi_object <- readRDS(cdi_path)
+  if (is.data.frame(cdi_object)) {
+    readr::write_tsv(as_tibble(cdi_object), file.path(stats_dir, "myeloid_meta_atlas_gpnmb_cdi.tsv"))
+  } else if (is.list(cdi_object)) {
+    cdi_tbl <- purrr::imap_dfr(cdi_object, function(value, key) {
+      if (is.data.frame(value)) {
+        tibble::as_tibble(value) %>% dplyr::mutate(source_block = key, .before = 1)
+      } else {
+        tibble::tibble(source_block = key, value = as.character(value))
+      }
+    })
+    readr::write_tsv(cdi_tbl, file.path(stats_dir, "myeloid_meta_atlas_gpnmb_cdi.tsv"))
+  }
+}
+```
+
+## Export summary
+
+```{r export-summary}
+export_summary <- tibble::tribble(
+  ~artifact, ~location,
+  "Counts matrix", file.path(dataset_dir, "matrix.mtx.gz"),
+  "Feature table", file.path(dataset_dir, "features.tsv.gz"),
+  "Barcode table", file.path(dataset_dir, "barcodes.tsv.gz"),
+  "Cell metadata", file.path(output_dir, "cns_myeloid_meta_atlas_cell_metadata.tsv.gz"),
+  "Sample metadata", file.path(output_dir, "cns_myeloid_meta_atlas_sample_metadata.tsv.gz"),
+  "Expression by sample", file.path(stats_dir, "myeloid_meta_atlas_gpnmb_expression_by_sample.tsv"),
+  "State counts", file.path(stats_dir, "myeloid_meta_atlas_state_counts.tsv"),
+  "Cohort manifest", file.path(stats_dir, "myeloid_meta_atlas_cohort_manifest.tsv")
+)
+
+readr::write_tsv(export_summary, file.path(stats_dir, "myeloid_meta_atlas_export_summary.tsv"))
+export_summary
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,607 @@
+---
+title: "GPNMB scRNA-seq methods reproducibility notebook"
+output:
+  html_document:
+    toc: true
+    toc_float: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Inputs and provenance
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(parallel)
+  library(foreach)
+  library(doParallel)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(readxl)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(fgsea)
+})
+```
+
+```{r helpers}
+submission_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+analysis_dir <- normalizePath(file.path(submission_dir, ".."), winslash = "/", mustWork = TRUE)
+output_dir <- file.path(submission_dir, "outputs")
+stats_dir <- file.path(output_dir, "stats")
+fig_dir <- file.path(output_dir, "figures")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(stats_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+worker_count <- max(1L, parallel::detectCores() - 1L)
+doParallel::registerDoParallel(cores = worker_count)
+
+pick_first_match <- function(x, candidates) {
+  hit <- candidates[candidates %in% x]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_feature_name <- function(object, candidates) {
+  feat <- rownames(object)
+  hit <- feat[toupper(feat) %in% toupper(candidates)]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_umap_reduction <- function(object, preferred = character()) {
+  reduction_names <- names(object@reductions)
+
+  preferred_hit <- preferred[preferred %in% reduction_names]
+  if (length(preferred_hit) > 0) {
+    return(preferred_hit[[1]])
+  }
+
+  umap_hit <- reduction_names[grepl("umap", reduction_names, ignore.case = TRUE)]
+  if (length(umap_hit) > 0) {
+    return(umap_hit[[1]])
+  }
+
+  two_dim_hit <- reduction_names[vapply(
+    reduction_names,
+    function(reduction_name) {
+      embedding <- tryCatch(SeuratObject::Embeddings(object[[reduction_name]]), error = function(e) NULL)
+      !is.null(embedding) && ncol(embedding) >= 2
+    },
+    logical(1)
+  )]
+  if (length(two_dim_hit) > 0) {
+    return(two_dim_hit[[1]])
+  }
+
+  stop("No UMAP-like or other 2D reduction found in the Seurat object.")
+}
+
+save_plot_pair <- function(plot_handle, stem, width = 8, height = 6) {
+  ggsave(filename = paste0(stem, ".pdf"), plot = plot_handle, width = width, height = height, units = "in")
+  ggsave(filename = paste0(stem, ".png"), plot = plot_handle, width = width, height = height, units = "in", dpi = 300)
+}
+
+extract_named_list <- function(x) {
+  if (is.list(x) && !is.data.frame(x)) {
+    out <- lapply(x, function(y) unique(as.character(stats::na.omit(y))))
+    out <- out[lengths(out) > 0]
+    return(out)
+  }
+  if (is.data.frame(x)) {
+    out <- lapply(x, function(y) unique(as.character(stats::na.omit(y))))
+    out <- out[lengths(out) > 0]
+    return(out)
+  }
+  stop("Could not coerce the gene set container into a named list.")
+}
+
+wide_df_to_named_list <- function(df) {
+  out <- lapply(df, function(col) {
+    col <- as.character(col)
+    col <- col[!is.na(col) & nzchar(col)]
+    unique(col)
+  })
+  out[lengths(out) > 0]
+}
+
+normalize_condition <- function(existing, barcode, sample_id) {
+  out <- rep(NA_character_, length(barcode))
+  if (!is.null(existing)) {
+    out <- as.character(existing)
+  }
+  joined <- paste(barcode, sample_id, out)
+  out[grepl("gpnmb|ko", joined, ignore.case = TRUE)] <- "KO"
+  out[grepl("ctrl|wt|gl261", joined, ignore.case = TRUE)] <- "WT"
+  out[grepl("pbs|sham", joined, ignore.case = TRUE)] <- "Sham"
+  out
+}
+
+extract_named_vector <- function(x, cell_ids) {
+  if (is.atomic(x) && !is.null(names(x))) {
+    return(x[names(x) %in% cell_ids])
+  }
+  if (is.data.frame(x)) {
+    id_col <- pick_first_match(colnames(x), c("cell_id", "cell", "barcode", "sample", "rownames"))
+    value_col <- pick_first_match(colnames(x), c("state", "subtype", "label", "assignment", "class"))
+    if (!is.na(id_col) && !is.na(value_col)) {
+      out <- x[[value_col]]
+      names(out) <- x[[id_col]]
+      return(out[names(out) %in% cell_ids])
+    }
+  }
+  if (is.list(x)) {
+    for (element in x) {
+      current <- tryCatch(extract_named_vector(element, cell_ids), error = function(e) NULL)
+      if (!is.null(current) && length(current) > 0) {
+        return(current)
+      }
+    }
+  }
+  NULL
+}
+
+run_safe_fgsea <- function(pathways, stats_tbl) {
+  stats_vec <- stats_tbl$avg_log2FC
+  names(stats_vec) <- stats_tbl$gene
+  stats_vec <- stats_vec[!is.na(stats_vec)]
+  stats_vec <- stats_vec[!duplicated(names(stats_vec))]
+  stats_vec <- sort(stats_vec, decreasing = TRUE)
+  fgsea::fgsea(pathways = pathways, stats = stats_vec, minSize = 5, maxSize = 500)
+}
+```
+
+```{r manifest}
+manifest <- tibble::tribble(
+  ~domain, ~label, ~path, ~notes,
+  "tumor", "Local tumor-side Seurat object", file.path(analysis_dir, "GPNMB_seurat_object_GL261_and_myeloid_111024.rds"), "Primary local tumor object for reproducible release",
+  "tumor", "Legacy Reboot2 upstream object", "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Preprocessed_Datasets/R727_M02_HH_SET4_GL261_Gpnmb_reboot_rPCA_integration_240322.Rdata", "Documented provenance from Reboot2",
+  "tumor", "Legacy GPNMB_02 upstream object", "R760_M01_NM2_r18_Neil_Gpnmb_Mm_081023.Rdata", "Documented provenance from GPNMB_02",
+  "tumor", "Reference atlas", file.path(analysis_dir, "R726_M02_HH_SET1_allGBM_reboot_rPCA_integration_ANNOTATED_220422.rds"), "Documented provenance",
+  "myeloid", "Integrated myeloid object", file.path(analysis_dir, "seurat_all_myeloid_160523.rds"), "Primary local myeloid object for reproducible release",
+  "myeloid", "Myeloid NMF object", file.path(analysis_dir, "NMF_myeloid_v1_160523.rds"), "Program context",
+  "myeloid", "Inferred-state object", file.path(analysis_dir, "ZM_myeloid_inferred_states.rds"), "State context",
+  "myeloid", "GPNMB CDI object", file.path(analysis_dir, "ZMyeloid_03_CDI_GPNMB_Myeloid_050524.rds"), "Associated genes"
+)
+
+readr::write_tsv(manifest, file.path(stats_dir, "methods_object_manifest.tsv"))
+manifest
+```
+
+## 2. GL261 WT vs KO tumor object overview
+
+```{r load-tumor}
+tumor_object_path <- manifest$path[manifest$label == "Local tumor-side Seurat object"]
+stopifnot(file.exists(tumor_object_path))
+so_tumor_all <- readRDS(tumor_object_path)
+tumor_umap <- pick_umap_reduction(so_tumor_all)
+
+tumor_meta <- so_tumor_all@meta.data %>%
+  tibble::rownames_to_column("cell_id")
+
+tumor_barcode_col <- pick_first_match(colnames(tumor_meta), c("Barcode", "barcode", "sample", "orig.ident"))
+tumor_sample_col <- pick_first_match(colnames(tumor_meta), c("sample", "Barcode", "orig.ident"))
+tumor_condition_col <- pick_first_match(colnames(tumor_meta), c("condition", "Condition"))
+tumor_class_col <- pick_first_match(colnames(tumor_meta), c("class", "Class"))
+tumor_subclass_col <- pick_first_match(colnames(tumor_meta), c("subclass", "Subclass"))
+
+tumor_meta$barcode_id <- if (!is.na(tumor_barcode_col)) as.character(tumor_meta[[tumor_barcode_col]]) else tumor_meta$cell_id
+tumor_meta$sample_id <- if (!is.na(tumor_sample_col)) as.character(tumor_meta[[tumor_sample_col]]) else tumor_meta$barcode_id
+tumor_meta$condition_clean <- normalize_condition(
+  existing = if (!is.na(tumor_condition_col)) tumor_meta[[tumor_condition_col]] else NULL,
+  barcode = tumor_meta$barcode_id,
+  sample_id = tumor_meta$sample_id
+)
+tumor_meta$class_clean <- if (!is.na(tumor_class_col)) as.character(tumor_meta[[tumor_class_col]]) else NA_character_
+tumor_meta$subclass_clean <- if (!is.na(tumor_subclass_col)) as.character(tumor_meta[[tumor_subclass_col]]) else NA_character_
+tumor_meta$is_tumor <- if (!is.na(tumor_class_col)) {
+  grepl("tumor|gbm|glia", tumor_meta$class_clean, ignore.case = TRUE)
+} else {
+  TRUE
+}
+
+so_tumor_all$condition_clean <- tumor_meta$condition_clean
+so_tumor_all$class_clean <- tumor_meta$class_clean
+so_tumor_all$subclass_clean <- tumor_meta$subclass_clean
+so_tumor_all$is_tumor <- tumor_meta$is_tumor
+
+tumor_gene_feature <- pick_feature_name(so_tumor_all, c("GPNMB", "Gpnmb"))
+tumor_state_cols <- intersect(
+  c("gbm.index", "Richards_Developmental", "Richards_Injury_Response", "Neftel_AC", "Neftel_MES1", "Neftel_MES2", "Neftel_OPC", "Neftel_NPC1", "Neftel_NPC2"),
+  colnames(tumor_meta)
+)
+
+tumor_overview <- tibble::tribble(
+  ~field, ~value,
+  "Tumor object", basename(tumor_object_path),
+  "UMAP reduction", tumor_umap,
+  "Condition column", ifelse(is.na(tumor_condition_col), "derived from barcode/sample", tumor_condition_col),
+  "Class column", ifelse(is.na(tumor_class_col), "not present", tumor_class_col),
+  "Subclass column", ifelse(is.na(tumor_subclass_col), "not present", tumor_subclass_col),
+  "Tumor-state columns detected", paste(tumor_state_cols, collapse = ", ")
+)
+
+readr::write_tsv(tumor_overview, file.path(stats_dir, "methods_tumor_overview.tsv"))
+tumor_overview
+```
+
+## 3. Tumor UMAP reproduction with key annotations
+
+```{r tumor-umaps}
+p_tumor_condition <- DimPlot(so_tumor_all, reduction = tumor_umap, group.by = "condition_clean", raster = FALSE) +
+  ggtitle("Tumor-side object", subtitle = "WT / KO / sham condition")
+save_plot_pair(p_tumor_condition, file.path(fig_dir, "methods_tumor_umap_condition"), width = 8, height = 6)
+
+if (!is.na(tumor_class_col)) {
+  p_tumor_class <- DimPlot(so_tumor_all, reduction = tumor_umap, group.by = "class_clean", raster = FALSE, label = TRUE, repel = TRUE) +
+    ggtitle("Tumor-side object", subtitle = "Class annotation")
+  save_plot_pair(p_tumor_class, file.path(fig_dir, "methods_tumor_umap_class"), width = 9, height = 7)
+}
+
+if (!is.na(tumor_subclass_col)) {
+  p_tumor_subclass <- DimPlot(so_tumor_all, reduction = tumor_umap, group.by = "subclass_clean", raster = FALSE, label = FALSE) +
+    ggtitle("Tumor-side object", subtitle = "Subclass annotation")
+  save_plot_pair(p_tumor_subclass, file.path(fig_dir, "methods_tumor_umap_subclass"), width = 10, height = 8)
+}
+
+if (!is.na(tumor_gene_feature)) {
+  p_tumor_gpnmb <- FeaturePlot(so_tumor_all, reduction = tumor_umap, features = tumor_gene_feature, raster = FALSE) +
+    ggtitle("Tumor-side object", subtitle = paste0(tumor_gene_feature, " expression"))
+  save_plot_pair(p_tumor_gpnmb, file.path(fig_dir, "methods_tumor_umap_gpnmb"), width = 8, height = 6)
+}
+```
+
+## 4. WT vs KO Neftel / GBM-state summaries and sample-level statistics
+
+```{r tumor-state-summary}
+if (length(tumor_state_cols) > 0) {
+  tumor_state_cell <- tumor_meta %>%
+    dplyr::filter(is_tumor, condition_clean %in% c("WT", "KO")) %>%
+    dplyr::select(cell_id, sample_id, barcode_id, condition_clean, dplyr::all_of(tumor_state_cols)) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(tumor_state_cols), names_to = "state", values_to = "score")
+} else {
+  tumor_state_cell <- tibble::tibble()
+}
+
+if (nrow(tumor_state_cell) > 0) {
+  tumor_state_sample <- tumor_state_cell %>%
+    dplyr::group_by(sample_id, barcode_id, condition_clean, state) %>%
+    dplyr::summarise(score_mean = mean(score, na.rm = TRUE), score_median = median(score, na.rm = TRUE), n_cells = dplyr::n(), .groups = "drop")
+
+  tumor_state_stats <- tumor_state_sample %>%
+    dplyr::group_by(state) %>%
+    dplyr::summarise(
+      p_value_t_test = tryCatch(t.test(score_mean ~ condition_clean)$p.value, error = function(e) NA_real_),
+      wt_samples = dplyr::n_distinct(sample_id[condition_clean %in% "WT"]),
+      ko_samples = dplyr::n_distinct(sample_id[condition_clean %in% "KO"]),
+      wt_cells = sum(n_cells[condition_clean %in% "WT"], na.rm = TRUE),
+      ko_cells = sum(n_cells[condition_clean %in% "KO"], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  readr::write_tsv(tumor_state_sample, file.path(stats_dir, "methods_tumor_state_sample_level.tsv"))
+  readr::write_tsv(tumor_state_stats, file.path(stats_dir, "methods_tumor_state_stats.tsv"))
+}
+```
+
+## 5. ED2-style GSEA ranking and plot regeneration
+
+```{r tumor-gsea}
+so_tumor_only <- so_tumor_all[, tumor_meta$is_tumor & tumor_meta$condition_clean %in% c("WT", "KO")]
+so_tumor_only$condition_clean <- factor(tumor_meta$condition_clean[tumor_meta$is_tumor & tumor_meta$condition_clean %in% c("WT", "KO")])
+Idents(so_tumor_only) <- so_tumor_only$condition_clean
+
+if (length(unique(as.character(Idents(so_tumor_only)))) >= 2) {
+  tumor_deg <- Seurat::FindMarkers(
+    object = so_tumor_only,
+    ident.1 = "WT",
+    ident.2 = "KO",
+    test.use = "wilcox",
+    logfc.threshold = 0,
+    min.pct = 0
+  )
+  tumor_deg$gene <- rownames(tumor_deg)
+  tumor_deg <- tumor_deg %>% tibble::as_tibble() %>% dplyr::arrange(desc(avg_log2FC))
+  readr::write_tsv(tumor_deg, file.path(stats_dir, "methods_tumor_wilcox_deg.tsv"))
+
+  if (requireNamespace("scMiko", quietly = TRUE)) {
+    gene_sets_raw <- scMiko::geneSets[["GBM_Hs_Neftel2019"]]
+    gene_sets <- extract_named_list(gene_sets_raw)
+    keep <- intersect(names(gene_sets), c("AC", "MES1", "MES2", "OPC", "NPC1", "NPC2", "Neftel_AC", "Neftel_MES1", "Neftel_MES2", "Neftel_OPC", "Neftel_NPC1", "Neftel_NPC2"))
+    gene_sets <- gene_sets[keep]
+    names(gene_sets) <- gsub("^Neftel_", "", names(gene_sets))
+
+    gsea_tbl <- run_safe_fgsea(gene_sets, tumor_deg) %>%
+      tibble::as_tibble() %>%
+      dplyr::arrange(padj, pval)
+    readr::write_tsv(gsea_tbl, file.path(stats_dir, "methods_tumor_neftel_gsea.tsv"))
+
+    ranked_stats <- tumor_deg$avg_log2FC
+    names(ranked_stats) <- tumor_deg$gene
+    ranked_stats <- ranked_stats[!duplicated(names(ranked_stats))]
+    ranked_stats <- sort(ranked_stats, decreasing = TRUE)
+
+    for (current_pathway in intersect(c("AC", "MES1", "MES2", "OPC", "NPC1", "NPC2"), names(gene_sets))) {
+      this_row <- gsea_tbl %>% dplyr::filter(pathway == current_pathway)
+      p <- fgsea::plotEnrichment(gene_sets[[current_pathway]], ranked_stats) +
+        labs(
+          title = paste0("ED2-style WT vs KO GSEA: ", current_pathway),
+          subtitle = if (nrow(this_row) > 0) {
+            paste0("NES = ", signif(this_row$NES[[1]], 3), "; p = ", signif(this_row$pval[[1]], 3))
+          } else {
+            "FGSEA result"
+          },
+          x = "Ranked differential-expression statistic",
+          y = "Enrichment score"
+        ) +
+        theme_bw()
+      save_plot_pair(p, file.path(fig_dir, paste0("methods_ed2_neftel_gsea_", tolower(current_pathway))), width = 7, height = 5)
+    }
+  }
+}
+```
+
+## 6. Myeloid meta-atlas overview
+
+```{r load-myeloid}
+myeloid_object_path <- manifest$path[manifest$label == "Integrated myeloid object"]
+stopifnot(file.exists(myeloid_object_path))
+so_myeloid <- readRDS(myeloid_object_path)
+# Prefer the stored BBKNN embedding ("b") for the integrated myeloid object.
+myeloid_umap <- pick_umap_reduction(so_myeloid, preferred = "b")
+
+myeloid_meta <- so_myeloid@meta.data %>%
+  tibble::rownames_to_column("cell_id")
+
+myeloid_sample_col <- pick_first_match(colnames(myeloid_meta), c("clean.id2", "clean.id", "sample", "Barcode", "orig.ident"))
+myeloid_study_col <- pick_first_match(colnames(myeloid_meta), c("study", "Study"))
+myeloid_etiology_col <- pick_first_match(colnames(myeloid_meta), c("etiology", "type", "diagnosis", "PR", "PR2"))
+myeloid_state_col <- pick_first_match(colnames(myeloid_meta), c("subtype", "state", "label", "assignment", "class", "G1"))
+
+myeloid_meta$sample_id <- if (!is.na(myeloid_sample_col)) as.character(myeloid_meta[[myeloid_sample_col]]) else myeloid_meta$cell_id
+myeloid_meta$study_clean <- if (!is.na(myeloid_study_col)) as.character(myeloid_meta[[myeloid_study_col]]) else "unspecified_study"
+myeloid_meta$etiology_clean <- if (!is.na(myeloid_etiology_col)) as.character(myeloid_meta[[myeloid_etiology_col]]) else "unspecified_etiology"
+myeloid_meta$state_clean <- if (!is.na(myeloid_state_col)) as.character(myeloid_meta[[myeloid_state_col]]) else NA_character_
+
+state_object_path <- manifest$path[manifest$label == "Inferred-state object"]
+if (file.exists(state_object_path)) {
+  inferred_states <- readRDS(state_object_path)
+  inferred_vector <- extract_named_vector(inferred_states, myeloid_meta$cell_id)
+  if (!is.null(inferred_vector) && length(inferred_vector) > 0) {
+    myeloid_meta$state_clean[match(names(inferred_vector), myeloid_meta$cell_id)] <- as.character(inferred_vector)
+  }
+}
+
+so_myeloid$sample_id <- myeloid_meta$sample_id
+so_myeloid$study_clean <- myeloid_meta$study_clean
+so_myeloid$etiology_clean <- myeloid_meta$etiology_clean
+so_myeloid$state_clean <- myeloid_meta$state_clean
+
+myeloid_gene_feature <- pick_feature_name(so_myeloid, c("GPNMB", "Gpnmb"))
+
+myeloid_overview <- tibble::tribble(
+  ~field, ~value,
+  "Myeloid object", basename(myeloid_object_path),
+  "UMAP reduction", myeloid_umap,
+  "Study column", ifelse(is.na(myeloid_study_col), "not present", myeloid_study_col),
+  "Etiology column", ifelse(is.na(myeloid_etiology_col), "not present", myeloid_etiology_col),
+  "State column", ifelse(is.na(myeloid_state_col), "supplemented from inferred-state object when available", myeloid_state_col)
+)
+
+readr::write_tsv(myeloid_overview, file.path(stats_dir, "methods_myeloid_overview.tsv"))
+myeloid_overview
+```
+
+## 7. Myeloid UMAP reproduction with key annotations
+
+```{r myeloid-umaps}
+if (!is.na(myeloid_study_col)) {
+  p_myeloid_study <- DimPlot(so_myeloid, reduction = myeloid_umap, group.by = "study_clean", raster = FALSE) +
+    ggtitle("Myeloid meta-atlas", subtitle = "Study / cohort")
+  save_plot_pair(p_myeloid_study, file.path(fig_dir, "methods_myeloid_umap_study"), width = 10, height = 8)
+}
+
+if (!is.na(myeloid_etiology_col)) {
+  p_myeloid_etiology <- DimPlot(so_myeloid, reduction = myeloid_umap, group.by = "etiology_clean", raster = FALSE) +
+    ggtitle("Myeloid meta-atlas", subtitle = "Etiology / diagnosis")
+  save_plot_pair(p_myeloid_etiology, file.path(fig_dir, "methods_myeloid_umap_etiology"), width = 10, height = 8)
+}
+
+if (any(!is.na(myeloid_meta$state_clean))) {
+  p_myeloid_state <- DimPlot(so_myeloid, reduction = myeloid_umap, group.by = "state_clean", raster = FALSE) +
+    ggtitle("Myeloid meta-atlas", subtitle = "Inferred state / subtype")
+  save_plot_pair(p_myeloid_state, file.path(fig_dir, "methods_myeloid_umap_state"), width = 10, height = 8)
+}
+
+if (!is.na(myeloid_gene_feature)) {
+  p_myeloid_gpnmb <- FeaturePlot(so_myeloid, reduction = myeloid_umap, features = myeloid_gene_feature, raster = FALSE) +
+    ggtitle("Myeloid meta-atlas", subtitle = paste0(myeloid_gene_feature, " expression"))
+  save_plot_pair(p_myeloid_gpnmb, file.path(fig_dir, "methods_myeloid_umap_gpnmb"), width = 8, height = 6)
+}
+```
+
+## 8. GPNMB expression across polarization states with manuscript-faithful tests
+
+```{r myeloid-polarization}
+marker_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/PR_GBM/Marker tables"
+smart_path <- file.path(marker_dir, "Smart_Signature.tsv")
+orecchioni_path <- file.path(marker_dir, "Orecchioni_2019_polarization_states.xlsx")
+buscher_path <- file.path(marker_dir, "Buscher_2017_polarization_states.xlsx")
+
+composite_polarization_cell <- tibble::tibble()
+composite_polarization_sample <- tibble::tibble()
+summary_tbl <- tibble::tibble()
+pairwise_tbl <- tibble::tibble()
+
+if (!is.na(myeloid_gene_feature) &&
+    file.exists(smart_path) &&
+    file.exists(orecchioni_path) &&
+    file.exists(buscher_path) &&
+    requireNamespace("scMiko", quietly = TRUE)) {
+
+  smart.list <- wide_df_to_named_list(read.delim(smart_path) %>% dplyr::select(-tidyselect::any_of("X")))
+  Orecchioni.2019.list <- wide_df_to_named_list(readxl::read_xlsx(orecchioni_path, "Sheet1"))
+  Buscher.2017.list <- wide_df_to_named_list(readxl::read_xlsx(buscher_path, "Sheet1"))
+
+  Jablonski.2015.list <- list(
+    Jablonski.2015.M0 = c("Sh2d3c", "Slc13a3", "Rcan1", "4632428N05Rik", "Trp53inp1", "Nr1d2", "Fcgrt", "Slc40a1", "Nfxl1", "Il16"),
+    Jablonski.2015.M1 = c("Cd38", "Cfb", "Slfn4", "H2-Q6", "Fpr1", "Slfn1", "Gpr18", "Ccrl2", "Fpr2", "Cxcl10", "Mpa2l", "Oasl1", "Tlr2", "Ms4a4c", "LOC100503664", "Irak3", "Hp", "Itgal", "Herc6", "Cd300lf", "Isf20", "Pstpip2", "Cp", "Isg15", "Probe 1452408_at", "E030037K03Rik", "Saa3", "Ifit1", "Marco", "F11r", "Rsad2", "Ddx60", "Pilr1", "Cpd", "Fam26f", "Aoah", "Gngt2", "Mx1", "Pyhin1", "Epb4.1l3", "Slfn8", "Arhgap24", "Nfkbiz", "Gbp6", "Stat1", "Zpb1", "D14Erd668e", "Ddx58", "Tuba4a", "Nfkbiz", "H2-T10", "Ebi3", "Stat1", "Fam176b", "Xaf1", "Gbp6", "Stat2", "Sepx1", "Ifit2"),
+    Jablonski.2015.M2 = c("Ptgs1", "Egr2", "Olfm1", "Flrt2", "P2ry1", "Vwf", "Bcar3", "Il6st", "Tanc2", "Mmp12", "Tcfec", "Clec7a", "Matk", "Myc", "Clec10a", "Amz1", "Tmem158", "Tiam1", "Rhoj", "Mmp9", "Mrc1", "Atp6v0a1", "Lmna", "Chst7", "Atp6v0d2", "Gnb4", "Emp2", "Cd300ld", "Cd83", "Socs6", "Actn1", "Plk2", "Ptpla")
+  )
+
+  Colombo.2024.list <- list(
+    Colombo.2024.M1 = c("Irf1", "Gbp5", "Batf2", "Gbp2", "Irgm1", "Igtp", "Gbp3", "Nampt", "Serpina3g", "Gbp7", "Cxcl10", "Nod1", "Gbp6", "Tap1", "Parp9", "Gbp9", "Casp4", "Gbp4", "Irgm2", "Pla2g4a", "Nlrc5", "Sp140", "Peli1", "Serpina3f", "Slco3a1", "Casp1", "Mlkl", "Il27"),
+    Colombo.2024.M2 = c("Tmem26", "Slc7a2", "Arg1", "Smap2", "Flt1", "Chil3", "Mgl2", "Flrt2", "Cblb", "Ak2", "Irf4", "Klf4", "Nfil3", "Ap2m1", "Rnf19b", "Cish", "Batf3", "Il1rl2", "Plekhf1", "Mcf2l")
+  )
+
+  master.set <- c(smart.list, Jablonski.2015.list, Orecchioni.2019.list, Colombo.2024.list, Buscher.2017.list)
+  master.set <- lapply(master.set, toupper)
+
+  match.list <- list(
+    Ghosh.2023 = c("Ghosh.2023.M1", "Ghosh.2023.M0", "Ghosh.2023.M2"),
+    Becker.2015 = c("Becker.2015.M1", "Becker.2015.M2"),
+    Bell.2016 = c("Bell.2016.M1", "Bell.2016.M2"),
+    Coates.2008 = c("Coates.2008.M1", "Coates.2008.M2"),
+    Martinez.2006 = c("Martinez.2006.M1", "Martinez.2006.M2"),
+    LM22 = c("LM22.M0", "LM22.M1", "LM22.M2"),
+    Murray.2017 = c("Murray.2017.M1", "Murray.2017.M2"),
+    Jablonski.2015 = c("Jablonski.2015.M0", "Jablonski.2015.M1", "Jablonski.2015.M2"),
+    Orecchioni.2019 = c("Orecchioni.2019.M1.invitro", "Orecchioni.2019.M2.invitro"),
+    Buscher.2017 = c("Buscher.2017.M1.invivo", "Buscher.2017.M2.invivo"),
+    Colombo.2024 = c("Colombo.2024.M1", "Colombo.2024.M2")
+  )
+
+  split_by <- if ("clean.id2" %in% colnames(so_myeloid@meta.data)) "clean.id2" else "sample_id"
+  so.hs <- SplitObject(so_myeloid, split.by = split_by)
+
+  ms.res.list <- list()
+  for (sname in names(so.hs)) {
+    object <- so.hs[[sname]]
+    ms.result <- scMiko::runMS(object = object, genelist = master.set, return.plots = FALSE, scale = FALSE)
+    df.res <- ms.result[["data"]] %>% dplyr::select(-tidyselect::any_of("class.ms"))
+    expr_df <- Seurat::FetchData(object, vars = myeloid_gene_feature)
+    colnames(expr_df) <- "expr"
+    df.res <- bind_cols(df.res, expr_df)
+    df.res$sample_id <- sname
+    ms.res.list[[sname]] <- df.res
+  }
+
+  df.expr <- bind_rows(ms.res.list)
+  match.list <- lapply(match.list, function(x) x[x %in% colnames(df.expr)])
+  match.list <- match.list[lengths(match.list) > 0]
+
+  m0_cols <- unlist(match.list)[grepl("\\.M0", unlist(match.list))]
+  m1_cols <- unlist(match.list)[grepl("\\.M1", unlist(match.list))]
+  m2_cols <- unlist(match.list)[grepl("\\.M2", unlist(match.list))]
+
+  if (length(m0_cols) > 0 && length(m1_cols) > 0 && length(m2_cols) > 0) {
+    df.expr$composite.M0 <- Matrix::rowMeans(as.matrix(df.expr[, m0_cols, drop = FALSE]))
+    df.expr$composite.M1 <- Matrix::rowMeans(as.matrix(df.expr[, m1_cols, drop = FALSE]))
+    df.expr$composite.M2 <- Matrix::rowMeans(as.matrix(df.expr[, m2_cols, drop = FALSE]))
+
+    composite_polarization_cell <- df.expr %>%
+      dplyr::select(sample_id, expr, composite.M0, composite.M1, composite.M2) %>%
+      dplyr::mutate(
+        subtype = c("composite.M0", "composite.M1", "composite.M2")[max.col(as.matrix(dplyr::select(., composite.M0, composite.M1, composite.M2)), ties.method = "first")]
+      )
+
+    composite_polarization_sample <- composite_polarization_cell %>%
+      dplyr::group_by(sample_id) %>%
+      dplyr::mutate(expr_scaled = as.numeric(scale(expr))) %>%
+      dplyr::group_by(sample_id, subtype) %>%
+      dplyr::summarise(
+        mean_expression = mean(expr_scaled, na.rm = TRUE),
+        median_expression = median(expr_scaled, na.rm = TRUE),
+        n_cells = dplyr::n(),
+        .groups = "drop"
+      )
+
+    overall_kw <- tryCatch(kruskal.test(mean_expression ~ subtype, data = composite_polarization_sample)$p.value, error = function(e) NA_real_)
+
+    pairwise_states <- sort(unique(composite_polarization_sample$subtype))
+    if (length(pairwise_states) >= 2) {
+      pairwise_tbl <- utils::combn(pairwise_states, 2, simplify = FALSE) %>%
+        lapply(function(x) {
+          current <- composite_polarization_sample %>% dplyr::filter(subtype %in% x)
+          tibble::tibble(
+            state_a = x[[1]],
+            state_b = x[[2]],
+            t_test_p = tryCatch(t.test(mean_expression ~ subtype, data = current)$p.value, error = function(e) NA_real_),
+            wilcox_p = tryCatch(wilcox.test(mean_expression ~ subtype, data = current)$p.value, error = function(e) NA_real_)
+          )
+        }) %>%
+        dplyr::bind_rows() %>%
+        dplyr::mutate(t_test_p_adj_bh = p.adjust(t_test_p, method = "BH"))
+    }
+
+    summary_tbl <- tibble::tibble(
+      test = c("kruskal_wallis_overall"),
+      p_value = c(overall_kw)
+    )
+
+    readr::write_tsv(composite_polarization_cell, file.path(stats_dir, "methods_myeloid_polarization_composite_cell_level.tsv"))
+    readr::write_tsv(composite_polarization_sample, file.path(stats_dir, "methods_myeloid_polarization_composite_sample_level.tsv"))
+    readr::write_tsv(summary_tbl, file.path(stats_dir, "methods_myeloid_polarization_overall_tests.tsv"))
+    readr::write_tsv(pairwise_tbl, file.path(stats_dir, "methods_myeloid_polarization_pairwise_tests.tsv"))
+  }
+}
+```
+
+## 9. Sample-size summary generation for scRNA-seq panels
+
+```{r sample-size-summary}
+sample_size_rows <- list()
+
+if (exists("composite_polarization_sample") && nrow(composite_polarization_sample) > 0) {
+  sample_size_rows[["ED10D"]] <- composite_polarization_sample %>%
+    dplyr::mutate(group = gsub("^composite\\.", "", subtype)) %>%
+    dplyr::group_by(panel = "ED10D", group) %>%
+    dplyr::summarise(
+      dataset_object = basename(myeloid_object_path),
+      biological_unit = "sample",
+      biological_n = dplyr::n_distinct(sample_id),
+      supporting_cell_count = sum(n_cells, na.rm = TRUE),
+      note = "GPNMB expression across composite M0/M1/M2 polarization states",
+      .groups = "drop"
+    )
+}
+
+atlas_qc_rows <- myeloid_meta %>%
+  dplyr::group_by(group = etiology_clean) %>%
+  dplyr::summarise(
+    dataset_object = basename(myeloid_object_path),
+    biological_unit = "sample",
+    biological_n = dplyr::n_distinct(sample_id),
+    supporting_cell_count = dplyr::n(),
+    note = "Atlas QC boxplots; attached PDF numbering differs from reviewer email",
+    .groups = "drop"
+  )
+
+sample_size_rows[["ED8D"]] <- atlas_qc_rows %>% dplyr::mutate(panel = "ED8D")
+sample_size_rows[["ED8E"]] <- atlas_qc_rows %>% dplyr::mutate(panel = "ED8E")
+
+sample_size_summary <- dplyr::bind_rows(sample_size_rows) %>%
+  dplyr::select(panel, group, dataset_object, biological_unit, biological_n, supporting_cell_count, note)
+
+readr::write_tsv(sample_size_summary, file.path(output_dir, "sample_size_summary.tsv"))
+sample_size_summary
+```
+
+## 10. Session info and object manifest
+
+```{r session-info}
+sessionInfo()
+```

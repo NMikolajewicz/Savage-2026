@@ -1,0 +1,418 @@
+---
+title: "Export GPNMB WT vs KO tumor dataset"
+output:
+  html_document:
+    toc: true
+    toc_float: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This notebook exports the local GPNMB WT vs KO tumor-side object into a publication-friendly bundle and reproduces the key UMAP-style panels needed for source-data release.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(parallel)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(fgsea)
+})
+```
+
+```{r helpers}
+submission_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+analysis_dir <- normalizePath(file.path(submission_dir, ".."), winslash = "/", mustWork = TRUE)
+output_dir <- file.path(submission_dir, "outputs")
+stats_dir <- file.path(output_dir, "stats")
+fig_dir <- file.path(output_dir, "figures")
+dataset_dir <- file.path(output_dir, "gpnmb_wtko_cell_by_gene")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(stats_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(dataset_dir, recursive = TRUE, showWarnings = FALSE)
+
+pick_first_match <- function(x, candidates) {
+  hit <- candidates[candidates %in% x]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_feature_name <- function(object, candidates) {
+  feat <- rownames(object)
+  hit <- feat[toupper(feat) %in% toupper(candidates)]
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  hit[[1]]
+}
+
+pick_assay_layer <- function(object, assay, preferred = c("counts", "data")) {
+  assay_obj <- object[[assay]]
+  available_layers <- tryCatch(SeuratObject::Layers(assay_obj), error = function(e) character())
+  for (candidate in preferred) {
+    if (candidate %in% available_layers) {
+      return(candidate)
+    }
+  }
+
+  available_slots <- tryCatch(slotNames(assay_obj), error = function(e) character())
+  for (candidate in preferred) {
+    if (candidate %in% available_slots) {
+      return(candidate)
+    }
+  }
+
+  stop(sprintf(
+    "Could not find any of %s in assay '%s'.",
+    paste(preferred, collapse = ", "),
+    assay
+  ))
+}
+
+pick_umap_reduction <- function(object) {
+  hit <- names(object@reductions)[grepl("umap", names(object@reductions), ignore.case = TRUE)]
+  if (length(hit) == 0) {
+    stop("No UMAP-like reduction found in the Seurat object.")
+  }
+  hit[[1]]
+}
+
+gzip_copy <- function(path) {
+  gz_path <- paste0(path, ".gz")
+  in_con <- file(path, open = "rb")
+  on.exit(close(in_con), add = TRUE)
+  out_con <- gzfile(gz_path, open = "wb")
+  on.exit(close(out_con), add = TRUE)
+  repeat {
+    chunk <- readBin(in_con, what = raw(), n = 65536)
+    if (!length(chunk)) {
+      break
+    }
+    writeBin(chunk, out_con)
+  }
+  unlink(path)
+  gz_path
+}
+
+write_tsv_gz <- function(df, path_stub) {
+  readr::write_tsv(df, path_stub)
+  gzip_copy(path_stub)
+}
+
+save_plot_pair <- function(plot_handle, stem, width = 8, height = 6) {
+  ggsave(filename = paste0(stem, ".pdf"), plot = plot_handle, width = width, height = height, units = "in")
+  ggsave(filename = paste0(stem, ".png"), plot = plot_handle, width = width, height = height, units = "in", dpi = 300)
+}
+
+extract_named_list <- function(x) {
+  if (is.list(x) && !is.data.frame(x)) {
+    out <- lapply(x, function(y) unique(as.character(stats::na.omit(y))))
+    out <- out[lengths(out) > 0]
+    return(out)
+  }
+  if (is.data.frame(x)) {
+    out <- lapply(x, function(y) unique(as.character(stats::na.omit(y))))
+    out <- out[lengths(out) > 0]
+    return(out)
+  }
+  stop("Could not coerce the gene set container into a named list.")
+}
+
+normalize_condition <- function(existing, barcode, sample_id) {
+  out <- rep(NA_character_, length(barcode))
+  if (!is.null(existing)) {
+    out <- as.character(existing)
+  }
+  joined <- paste(barcode, sample_id, out)
+  out[grepl("gpnmb|ko", joined, ignore.case = TRUE)] <- "KO"
+  out[grepl("ctrl|wt|gl261", joined, ignore.case = TRUE)] <- "WT"
+  out[grepl("pbs|sham", joined, ignore.case = TRUE)] <- "Sham"
+  out
+}
+
+get_tumor_mask <- function(meta, class_col, subclass_col) {
+  out <- rep(TRUE, nrow(meta))
+  if (!is.na(class_col)) {
+    out <- grepl("tumor|gbm|glia", meta[[class_col]], ignore.case = TRUE)
+  }
+  if (all(!out) && !is.na(subclass_col)) {
+    out <- grepl("gbm|gl261|ct2a", meta[[subclass_col]], ignore.case = TRUE)
+  }
+  out
+}
+
+run_safe_fgsea <- function(pathways, stats_tbl) {
+  stats_vec <- stats_tbl$avg_log2FC
+  names(stats_vec) <- stats_tbl$gene
+  stats_vec <- stats_vec[!is.na(stats_vec)]
+  stats_vec <- stats_vec[!duplicated(names(stats_vec))]
+  stats_vec <- sort(stats_vec, decreasing = TRUE)
+  fgsea::fgsea(pathways = pathways, stats = stats_vec, minSize = 5, maxSize = 500)
+}
+```
+
+## Inputs and provenance
+
+```{r provenance}
+manifest <- tibble::tribble(
+  ~label, ~path, ~role, ~status,
+  "Local tumor-side Seurat object", file.path(analysis_dir, "GPNMB_seurat_object_GL261_and_myeloid_111024.rds"), "Primary execution target", "required",
+  "Legacy Reboot2 upstream object", "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Preprocessed_Datasets/R727_M02_HH_SET4_GL261_Gpnmb_reboot_rPCA_integration_240322.Rdata", "Documented provenance only", "optional",
+  "Legacy GPNMB_02 upstream object", "R760_M01_NM2_r18_Neil_Gpnmb_Mm_081023.Rdata", "Documented provenance only", "optional",
+  "Reference atlas", file.path(analysis_dir, "R726_M02_HH_SET1_allGBM_reboot_rPCA_integration_ANNOTATED_220422.rds"), "Documented provenance only", "optional",
+  "Class assignments", file.path(analysis_dir, "GPNMB_02_class_assignments_231023.rds"), "Documented provenance only", "optional",
+  "NMF program object", file.path(analysis_dir, "NMF_neil_gpnmb_v1_241023.rds"), "Documented provenance only", "optional"
+)
+
+readr::write_tsv(manifest, file.path(stats_dir, "gpnmb_wtko_object_manifest.tsv"))
+manifest
+```
+
+```{r load-object}
+object_path <- manifest$path[manifest$label == "Local tumor-side Seurat object"]
+stopifnot(file.exists(object_path))
+so <- readRDS(object_path)
+umap_reduction <- pick_umap_reduction(so)
+
+meta <- so@meta.data %>%
+  tibble::rownames_to_column("cell_id")
+
+barcode_col <- pick_first_match(colnames(meta), c("Barcode", "barcode", "sample", "orig.ident"))
+sample_col <- pick_first_match(colnames(meta), c("sample", "Barcode", "orig.ident"))
+condition_col <- pick_first_match(colnames(meta), c("condition", "Condition"))
+class_col <- pick_first_match(colnames(meta), c("class", "Class"))
+subclass_col <- pick_first_match(colnames(meta), c("subclass", "Subclass"))
+
+meta$barcode_id <- if (!is.na(barcode_col)) as.character(meta[[barcode_col]]) else meta$cell_id
+meta$sample_id <- if (!is.na(sample_col)) as.character(meta[[sample_col]]) else meta$barcode_id
+meta$condition_clean <- normalize_condition(
+  existing = if (!is.na(condition_col)) meta[[condition_col]] else NULL,
+  barcode = meta$barcode_id,
+  sample_id = meta$sample_id
+)
+meta$class_clean <- if (!is.na(class_col)) as.character(meta[[class_col]]) else NA_character_
+meta$subclass_clean <- if (!is.na(subclass_col)) as.character(meta[[subclass_col]]) else NA_character_
+meta$is_tumor <- get_tumor_mask(meta, class_col, subclass_col)
+
+so$condition_clean <- meta$condition_clean
+so$class_clean <- meta$class_clean
+so$subclass_clean <- meta$subclass_clean
+so$is_tumor <- meta$is_tumor
+
+gene_feature <- pick_feature_name(so, c("GPNMB", "Gpnmb"))
+state_cols <- intersect(
+  c("gbm.index", "Richards_Developmental", "Richards_Injury_Response", "Neftel_AC", "Neftel_MES1", "Neftel_MES2", "Neftel_OPC", "Neftel_NPC1", "Neftel_NPC2"),
+  colnames(meta)
+)
+
+assay_use <- if ("RNA" %in% names(so@assays)) "RNA" else DefaultAssay(so)
+layer_use <- pick_assay_layer(so, assay_use)
+counts_mat <- Seurat::GetAssayData(so, assay = assay_use, layer = layer_use)
+
+meta_export <- meta %>%
+  dplyr::select(cell_id, barcode_id, sample_id, condition_clean, class_clean, subclass_clean, is_tumor, dplyr::everything())
+```
+
+## Export publication-friendly matrices and metadata
+
+```{r export-matrix}
+matrix_path <- file.path(dataset_dir, "matrix.mtx")
+Matrix::writeMM(counts_mat, matrix_path)
+gzip_copy(matrix_path)
+
+feature_tbl <- tibble::tibble(
+  feature_id = rownames(counts_mat),
+  feature_name = rownames(counts_mat)
+)
+barcode_tbl <- tibble::tibble(barcode = colnames(counts_mat))
+
+write_tsv_gz(feature_tbl, file.path(dataset_dir, "features.tsv"))
+write_tsv_gz(barcode_tbl, file.path(dataset_dir, "barcodes.tsv"))
+write_tsv_gz(meta_export, file.path(output_dir, "gpnmb_wtko_cell_metadata.tsv"))
+
+sample_metadata <- meta_export %>%
+  dplyr::group_by(sample_id, barcode_id, condition_clean, class_clean, subclass_clean, is_tumor) %>%
+  dplyr::summarise(n_cells = dplyr::n(), .groups = "drop")
+
+write_tsv_gz(sample_metadata, file.path(output_dir, "gpnmb_wtko_sample_metadata.tsv"))
+```
+
+## QC and provenance summary
+
+```{r qc-summary}
+qc_summary <- tibble::tribble(
+  ~field, ~value,
+  "Primary object", basename(object_path),
+  "UMAP reduction", umap_reduction,
+  "Expression assay", assay_use,
+  "Expression layer", layer_use,
+  "Condition field", ifelse(is.na(condition_col), "derived from barcode/sample", condition_col),
+  "Sample field", ifelse(is.na(sample_col), "derived from barcode", sample_col),
+  "Class field", ifelse(is.na(class_col), "not present", class_col),
+  "Subclass field", ifelse(is.na(subclass_col), "not present", subclass_col)
+)
+
+readr::write_tsv(qc_summary, file.path(stats_dir, "gpnmb_wtko_qc_summary.tsv"))
+qc_summary
+```
+
+## UMAP reproduction
+
+```{r umap-plots}
+if (!is.na(condition_col) || any(!is.na(meta$condition_clean))) {
+  p_condition <- DimPlot(so, reduction = umap_reduction, group.by = "condition_clean", raster = FALSE) +
+    ggtitle("GPNMB WT vs KO", subtitle = "Condition")
+  save_plot_pair(p_condition, file.path(fig_dir, "gpnmb_wtko_umap_condition"), width = 8, height = 6)
+}
+
+if (!is.na(class_col)) {
+  p_class <- DimPlot(so, reduction = umap_reduction, group.by = "class_clean", raster = FALSE, label = TRUE, repel = TRUE) +
+    ggtitle("GPNMB WT vs KO", subtitle = "Class annotation")
+  save_plot_pair(p_class, file.path(fig_dir, "gpnmb_wtko_umap_class"), width = 9, height = 7)
+}
+
+if (!is.na(subclass_col)) {
+  p_subclass <- DimPlot(so, reduction = umap_reduction, group.by = "subclass_clean", raster = FALSE, label = FALSE) +
+    ggtitle("GPNMB WT vs KO", subtitle = "Subclass annotation")
+  save_plot_pair(p_subclass, file.path(fig_dir, "gpnmb_wtko_umap_subclass"), width = 10, height = 8)
+}
+
+if (!is.na(gene_feature)) {
+  p_gpnmb <- FeaturePlot(so, reduction = umap_reduction, features = gene_feature, raster = FALSE) +
+    ggtitle("GPNMB WT vs KO", subtitle = paste0(gene_feature, " expression"))
+  save_plot_pair(p_gpnmb, file.path(fig_dir, "gpnmb_wtko_umap_gpnmb_expression"), width = 8, height = 6)
+}
+
+if (length(state_cols) > 0) {
+  state_panels <- lapply(state_cols, function(x) {
+    FeaturePlot(so, reduction = umap_reduction, features = x, raster = FALSE) + ggtitle(x)
+  })
+  p_states <- patchwork::wrap_plots(state_panels, ncol = 2)
+  save_plot_pair(p_states, file.path(fig_dir, "gpnmb_wtko_umap_tumor_states"), width = 12, height = 10)
+}
+```
+
+## Figure-input tables for WT vs KO tumor-state summaries
+
+```{r tumor-state-exports}
+tumor_meta <- meta_export %>% dplyr::filter(is_tumor, condition_clean %in% c("WT", "KO"))
+
+if (length(state_cols) > 0 && nrow(tumor_meta) > 0) {
+  tumor_state_cell <- tumor_meta %>%
+    dplyr::select(cell_id, sample_id, condition_clean, barcode_id, dplyr::all_of(state_cols)) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(state_cols), names_to = "state", values_to = "score")
+
+  tumor_state_sample <- tumor_state_cell %>%
+    dplyr::group_by(sample_id, barcode_id, condition_clean, state) %>%
+    dplyr::summarise(score_mean = mean(score, na.rm = TRUE), score_median = median(score, na.rm = TRUE), n_cells = dplyr::n(), .groups = "drop")
+
+  tumor_state_stats <- tumor_state_sample %>%
+    dplyr::group_by(state) %>%
+    dplyr::summarise(
+      p_value_t_test = tryCatch(t.test(score_mean ~ condition_clean)$p.value, error = function(e) NA_real_),
+      wt_n = dplyr::n_distinct(sample_id[condition_clean %in% "WT"]),
+      ko_n = dplyr::n_distinct(sample_id[condition_clean %in% "KO"]),
+      wt_cells = sum(n_cells[condition_clean %in% "WT"], na.rm = TRUE),
+      ko_cells = sum(n_cells[condition_clean %in% "KO"], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  readr::write_tsv(tumor_state_cell, file.path(stats_dir, "gpnmb_wtko_tumor_state_cell_level.tsv"))
+  readr::write_tsv(tumor_state_sample, file.path(stats_dir, "gpnmb_wtko_tumor_state_sample_level.tsv"))
+  readr::write_tsv(tumor_state_stats, file.path(stats_dir, "gpnmb_wtko_tumor_state_stats.tsv"))
+}
+```
+
+## Differential expression and ED2-style GSEA source tables
+
+```{r wt-ko-deg-and-gsea}
+tumor_subset <- so[, meta_export$is_tumor & meta_export$condition_clean %in% c("WT", "KO")]
+tumor_subset$condition_clean <- droplevels(factor(meta_export$condition_clean[meta_export$is_tumor & meta_export$condition_clean %in% c("WT", "KO")]))
+Idents(tumor_subset) <- tumor_subset$condition_clean
+
+if (length(unique(as.character(Idents(tumor_subset)))) >= 2) {
+  wtko_de <- Seurat::FindMarkers(
+    object = tumor_subset,
+    ident.1 = "WT",
+    ident.2 = "KO",
+    test.use = "wilcox",
+    logfc.threshold = 0,
+    min.pct = 0
+  )
+  wtko_de$gene <- rownames(wtko_de)
+  wtko_de <- wtko_de %>% tibble::as_tibble() %>% dplyr::arrange(desc(avg_log2FC))
+  readr::write_tsv(wtko_de, file.path(stats_dir, "gpnmb_wtko_wilcox_deg.tsv"))
+
+  if (requireNamespace("scMiko", quietly = TRUE)) {
+    gene_sets_raw <- scMiko::geneSets[["GBM_Hs_Neftel2019"]]
+    gene_sets <- extract_named_list(gene_sets_raw)
+    keep <- intersect(names(gene_sets), c("AC", "MES1", "MES2", "OPC", "NPC1", "NPC2", "Neftel_AC", "Neftel_MES1", "Neftel_MES2", "Neftel_OPC", "Neftel_NPC1", "Neftel_NPC2"))
+    gene_sets <- gene_sets[keep]
+    names(gene_sets) <- gsub("^Neftel_", "", names(gene_sets))
+    gsea_tbl <- run_safe_fgsea(gene_sets, wtko_de)
+    gsea_tbl <- gsea_tbl %>% tibble::as_tibble() %>% dplyr::arrange(padj, pval)
+    readr::write_tsv(gsea_tbl, file.path(stats_dir, "gpnmb_wtko_neftel_gsea.tsv"))
+
+    ranked_stats <- wtko_de$avg_log2FC
+    names(ranked_stats) <- wtko_de$gene
+    ranked_stats <- ranked_stats[!duplicated(names(ranked_stats))]
+    ranked_stats <- sort(ranked_stats, decreasing = TRUE)
+
+    for (current_pathway in intersect(c("AC", "MES1", "MES2", "OPC", "NPC1", "NPC2"), names(gene_sets))) {
+      this_row <- gsea_tbl %>% dplyr::filter(pathway == current_pathway)
+      p <- fgsea::plotEnrichment(gene_sets[[current_pathway]], ranked_stats) +
+        labs(
+          title = paste0("WT vs KO Neftel GSEA: ", current_pathway),
+          subtitle = if (nrow(this_row) > 0) {
+            paste0("NES = ", signif(this_row$NES[[1]], 3), "; p = ", signif(this_row$pval[[1]], 3))
+          } else {
+            "FGSEA result"
+          },
+          x = "Ranked differential-expression statistic",
+          y = "Enrichment score"
+        ) +
+        theme_bw()
+      save_plot_pair(p, file.path(fig_dir, paste0("ed2_neftel_gsea_", tolower(current_pathway))), width = 7, height = 5)
+    }
+  }
+}
+```
+
+## Export summary
+
+```{r export-summary}
+export_summary <- tibble::tribble(
+  ~artifact, ~location,
+  "Counts matrix", file.path(dataset_dir, "matrix.mtx.gz"),
+  "Feature table", file.path(dataset_dir, "features.tsv.gz"),
+  "Barcode table", file.path(dataset_dir, "barcodes.tsv.gz"),
+  "Cell metadata", file.path(output_dir, "gpnmb_wtko_cell_metadata.tsv.gz"),
+  "Sample metadata", file.path(output_dir, "gpnmb_wtko_sample_metadata.tsv.gz"),
+  "Tumor state stats", file.path(stats_dir, "gpnmb_wtko_tumor_state_stats.tsv"),
+  "Wilcoxon DE table", file.path(stats_dir, "gpnmb_wtko_wilcox_deg.tsv"),
+  "Neftel GSEA table", file.path(stats_dir, "gpnmb_wtko_neftel_gsea.tsv")
+)
+
+readr::write_tsv(export_summary, file.path(stats_dir, "gpnmb_wtko_export_summary.tsv"))
+export_summary
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
