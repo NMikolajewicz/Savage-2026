@@ -1,10 +1,11 @@
 # README
 
 ## Citation
-Savage N., Grewal S., Shaikh V., Zemp F., McKenna D., Mikolajewicz M., Najem H., Pyczek J., Wei J., Taleb M., Asselstine L., Anand A., Chafe S., Zhai K., Maich W., Chokshi C., Patel H., Korman T., Subapanditha M., Shapovalova Z., Tatari N., Miltec P., Chen D., Pacheco S., Han H., Chan J., Brown K., Venugopal C., Kislinger T., Heimberger A., Moffat J., Mahoney D., Singh S. (2026). 	Dual tumor-myeloid targeting of glioblastoma with GPNMB CAR-T cells. *Nature*. 
+Savage N., Grewal S., Shaikh V., Zemp F., McKenna D., Mikolajewicz N., Najem H., Pyczek J., Wei J., Taleb M., Asselstine L., Anand A., Chafe S., Zhai K., Maich W., Chokshi C., Patel H., Korman T., Subapanditha M., Shapovalova Z., Tatari N., Miltec P., Chen D., Pacheco S., Han H., Chan J., Brown K., Venugopal C., Kislinger T., Heimberger A., Moffat J., Mahoney D., Singh S. (2026). 	Dual tumor-myeloid targeting of glioblastoma with GPNMB CAR-T cells. *Nature*. 
 
 ## Data Availability
-https://doi.org/10.6084/m9.figshare.31926300 
+Myeloid Meta-Atlas: [https://doi.org/10.6084/m9.figshare.31926300](https://doi.org/10.6084/m9.figshare.31926300)
+GL261 WT vs KO tumor dataset: [https://doi.org/10.6084/m9.figshare.31926462](https://doi.org/10.6084/m9.figshare.31926462)
 
 ## Files
 - `01_export_gpnmb_wtko_publishable.Rmd`: exports the GL261 WT vs KO tumor dataset, writes a Matrix Market bundle plus metadata tables, and reproduces tumor-side UMAP, tumor-state, DEG, and Neftel GSEA outputs.
